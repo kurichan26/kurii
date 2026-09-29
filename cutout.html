@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>写真からステッカーを作る</title>
+  </head>
+  <body>
+    <main>
+      <h1>写真からステッカーを作る</h1>
+      <p>写真を選ぶか撮影し、残したい物をクリックしてください。背景が透明なPNGを作れます。</p>
+
+      <p>
+        <label for="image-file">写真を選択:</label>
+        <input id="image-file" type="file" accept="image/*" />
+      </p>
+      <p>
+        <button id="camera-start" type="button">カメラを起動</button>
+        <button id="camera-capture" type="button" disabled>撮影</button>
+      </p>
+      <video id="camera-preview" autoplay muted playsinline hidden style="max-width: 100%; height: auto"></video>
+
+      <fieldset>
+        <legend>クリックの意味</legend>
+        <label><input type="radio" name="point-mode" value="1" checked />残したい物</label>
+        <label><input type="radio" name="point-mode" value="0" />消したい領域</label>
+      </fieldset>
+      <button id="clear-points" type="button" disabled>選択点をクリア</button>
+      <p id="status" role="status" aria-live="polite">写真を選択または撮影してください。</p>
+
+      <h2>写真をクリックして選択</h2>
+      <canvas id="source-view" hidden style="max-width: 100%; height: auto" aria-label="選択点を指定する写真"></canvas>
+      <h2>切り抜き結果</h2>
+      <canvas id="cutout-result" hidden style="max-width: 100%; height: auto" aria-label="背景が透明な切り抜き結果"></canvas>
+      <p><button id="download-button" type="button" disabled>透明PNGをダウンロード</button></p>
+    </main>
+
+    <script type="module">
+      import {
+        AutoProcessor,
+        RawImage,
+        SamModel,
+        Tensor,
+        env,
+      } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+
+      env.allowLocalModels = false;
+
+      const MODEL_ID = "Xenova/slimsam-77-uniform";
+      const MAX_IMAGE_SIDE = 960;
+      const imageInput = document.querySelector("#image-file");
+      const cameraStartButton = document.querySelector("#camera-start");
+      const cameraCaptureButton = document.querySelector("#camera-capture");
+      const cameraVideo = document.querySelector("#camera-preview");
+      const clearPointsButton = document.querySelector("#clear-points");
+      const statusElement = document.querySelector("#status");
+      const sourceView = document.querySelector("#source-view");
+      const cutoutResult = document.querySelector("#cutout-result");
+      const downloadButton = document.querySelector("#download-button");
+      const inputCanvas = document.createElement("canvas");
+      const points = [];
+      const downloadObjectUrls = [];
+      let samModel;
+      let samProcessor;
+      let modelLoadPromise;
+      let processedImage;
+      let imageEmbeddings;
+      let cameraStream;
+      let imageReady = false;
+      let busy = false;
+      let hasMask = false;
+
+      function setStatus(message) {
+        statusElement.textContent = message;
+      }
+
+      function updateControls() {
+        imageInput.disabled = busy;
+        cameraStartButton.disabled = busy || Boolean(cameraStream);
+        cameraCaptureButton.disabled = busy || !cameraStream;
+        clearPointsButton.disabled = busy || points.length === 0;
+        downloadButton.disabled = busy || !hasMask;
+        sourceView.style.pointerEvents = busy ? "none" : "auto";
+      }
+
+      async function runExclusive(task) {
+        if (busy) return;
+        busy = true;
+        updateControls();
+        try {
+          await task();
+        } catch (error) {
+          console.error(error);
+          setStatus(`エラー: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          busy = false;
+          updateControls();
+        }
+      }
+
+      function disposeTensorTree(value, seen = new Set()) {
+        if (!value || typeof value !== "object" || seen.has(value)) return;
+        seen.add(value);
+
+        if (typeof value.dispose === "function") {
+          value.dispose();
+          return;
+        }
+        if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
+        if (Array.isArray(value)) {
+          for (const item of value) disposeTensorTree(item, seen);
+          return;
+        }
+        for (const item of Object.values(value)) disposeTensorTree(item, seen);
+      }
+
+      function clearImageEmbeddings() {
+        disposeTensorTree(imageEmbeddings);
+        disposeTensorTree(processedImage);
+        imageEmbeddings = undefined;
+        processedImage = undefined;
+      }
+
+      function clearMask() {
+        const context = cutoutResult.getContext("2d");
+        if (context) context.clearRect(0, 0, cutoutResult.width, cutoutResult.height);
+        cutoutResult.hidden = true;
+        hasMask = false;
+        updateControls();
+      }
+
+      function drawSourceView() {
+        sourceView.width = inputCanvas.width;
+        sourceView.height = inputCanvas.height;
+        sourceView.hidden = !imageReady;
+        if (!imageReady) return;
+
+        const context = sourceView.getContext("2d");
+        if (!context) throw new Error("写真を表示するCanvas 2D contextを取得できませんでした。");
+        context.drawImage(inputCanvas, 0, 0);
+        const radius = Math.max(6, inputCanvas.width / 120);
+        for (const point of points) {
+          context.beginPath();
+          context.arc(point.x * inputCanvas.width, point.y * inputCanvas.height, radius, 0, Math.PI * 2);
+          context.fillStyle = point.label === 1 ? "lime" : "red";
+          context.fill();
+          context.strokeStyle = "white";
+          context.lineWidth = Math.max(1, radius / 4);
+          context.stroke();
+        }
+      }
+
+      function resetPhoto() {
+        clearImageEmbeddings();
+        points.length = 0;
+        imageReady = false;
+        drawSourceView();
+        clearMask();
+        updateControls();
+      }
+
+      function setPhoto(canvas) {
+        resetPhoto();
+        inputCanvas.width = canvas.width;
+        inputCanvas.height = canvas.height;
+        const context = inputCanvas.getContext("2d");
+        if (!context) throw new Error("写真を処理するCanvas 2D contextを取得できませんでした。");
+        context.drawImage(canvas, 0, 0);
+        imageReady = true;
+        drawSourceView();
+        clearMask();
+        updateControls();
+      }
+
+      async function fileToCanvas(file) {
+        const url = URL.createObjectURL(file);
+        const image = new Image();
+        try {
+          image.src = url;
+          await image.decode();
+          const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(image.naturalWidth, image.naturalHeight));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+          const context = canvas.getContext("2d");
+          if (!context) throw new Error("写真を読み込むCanvas 2D contextを取得できませんでした。");
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          return canvas;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+
+      async function requireWebGPU() {
+        if (!navigator.gpu) throw new Error("WebGPU が利用できません。対応ブラウザで開いてください。");
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) throw new Error("WebGPU adapter を取得できませんでした。");
+      }
+
+      async function ensureModel() {
+        if (samModel && samProcessor) return;
+        if (!modelLoadPromise) {
+          modelLoadPromise = (async () => {
+            setStatus("SlimSAMを読み込んでいます。初回はダウンロードに時間がかかります。");
+            const progressCallback = (event) => {
+              if (event.status === "progress" && Number.isFinite(event.progress)) {
+                const file = event.file ? ` (${event.file})` : "";
+                setStatus(`モデルをダウンロード中: ${event.progress.toFixed(0)}%${file}`);
+              }
+            };
+            const processor = await AutoProcessor.from_pretrained(MODEL_ID);
+            const model = await SamModel.from_pretrained(MODEL_ID, {
+              device: "webgpu",
+              dtype: "fp16",
+              progress_callback: progressCallback,
+            });
+            samProcessor = processor;
+            samModel = model;
+          })().catch((error) => {
+            modelLoadPromise = undefined;
+            throw error;
+          });
+        }
+        await modelLoadPromise;
+      }
+
+      async function ensureImageEmbeddings() {
+        if (imageEmbeddings) return;
+        await requireWebGPU();
+        await ensureModel();
+        setStatus("写真を一度だけ解析しています。");
+        const processed = await samProcessor(RawImage.fromCanvas(inputCanvas));
+        try {
+          const embeddings = await samModel.get_image_embeddings(processed);
+          processedImage = processed;
+          imageEmbeddings = embeddings;
+        } catch (error) {
+          disposeTensorTree(processed);
+          throw error;
+        }
+      }
+
+      function drawCutout(maskData, width, height) {
+        if (width !== inputCanvas.width || height !== inputCanvas.height) {
+          throw new Error(`マスクサイズが写真と一致しません: ${width} × ${height}`);
+        }
+        const sourceContext = inputCanvas.getContext("2d");
+        const resultContext = cutoutResult.getContext("2d");
+        if (!sourceContext || !resultContext) {
+          throw new Error("切り抜きに必要なCanvas 2D contextを取得できませんでした。");
+        }
+
+        let left = width;
+        let top = height;
+        let right = -1;
+        let bottom = -1;
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            if (!maskData[y * width + x]) continue;
+            left = Math.min(left, x);
+            top = Math.min(top, y);
+            right = Math.max(right, x);
+            bottom = Math.max(bottom, y);
+          }
+        }
+        if (right < left || bottom < top) throw new Error("選択した物のマスクが空でした。別の場所をクリックしてください。");
+
+        const padding = Math.max(4, Math.round(Math.max(width, height) * 0.01));
+        const cropLeft = Math.max(0, left - padding);
+        const cropTop = Math.max(0, top - padding);
+        const cropRight = Math.min(width, right + padding + 1);
+        const cropBottom = Math.min(height, bottom + padding + 1);
+        const cropWidth = cropRight - cropLeft;
+        const cropHeight = cropBottom - cropTop;
+        const croppedImage = sourceContext.getImageData(cropLeft, cropTop, cropWidth, cropHeight);
+        for (let y = 0; y < cropHeight; y++) {
+          for (let x = 0; x < cropWidth; x++) {
+            const sourceIndex = (cropTop + y) * width + cropLeft + x;
+            if (!maskData[sourceIndex]) croppedImage.data[(y * cropWidth + x) * 4 + 3] = 0;
+          }
+        }
+
+        cutoutResult.width = cropWidth;
+        cutoutResult.height = cropHeight;
+        cutoutResult.hidden = false;
+        cutoutResult.getContext("2d").putImageData(croppedImage, 0, 0);
+        hasMask = true;
+        updateControls();
+      }
+
+      async function decodeMask() {
+        const reshapedSize = processedImage.reshaped_input_sizes[0];
+        const pointValues = points.flatMap((point) => [
+          point.x * reshapedSize[1],
+          point.y * reshapedSize[0],
+        ]);
+        const inputPoints = new Tensor("float32", pointValues, [1, 1, points.length, 2]);
+        const inputLabels = new Tensor(
+          "int64",
+          points.map((point) => BigInt(point.label)),
+          [1, 1, points.length],
+        );
+        let outputs;
+        let masks;
+        try {
+          outputs = await samModel({
+            ...imageEmbeddings,
+            input_points: inputPoints,
+            input_labels: inputLabels,
+          });
+          masks = await samProcessor.post_process_masks(
+            outputs.pred_masks,
+            processedImage.original_sizes,
+            processedImage.reshaped_input_sizes,
+          );
+
+          const scores = outputs.iou_scores.data;
+          let best = 0;
+          for (let i = 1; i < scores.length; i++) {
+            if (scores[i] > scores[best]) best = i;
+          }
+
+          const maskTensor = masks[0];
+          if (!maskTensor || maskTensor.dims.length !== 4 || maskTensor.dims[0] !== 1) {
+            throw new Error(`SAMのマスク出力shapeが想定外です: [${maskTensor?.dims?.join(", ") ?? "なし"}]`);
+          }
+          const [, candidateCount, height, width] = maskTensor.dims;
+          if (best >= candidateCount || scores.length !== candidateCount) {
+            throw new Error("SAMのマスク候補数とスコア数が一致しません。");
+          }
+          const pixelsPerMask = height * width;
+          const offset = best * pixelsPerMask;
+          drawCutout(maskTensor.data.subarray(offset, offset + pixelsPerMask), width, height);
+          setStatus(`切り抜きました。選択点${points.filter((point) => point.label === 1).length}個、除外点${points.filter((point) => point.label === 0).length}個。クリックして調整できます。`);
+        } finally {
+          inputPoints.dispose?.();
+          inputLabels.dispose?.();
+          disposeTensorTree(outputs);
+          disposeTensorTree(masks);
+        }
+      }
+
+      async function startCamera() {
+        if (!window.isSecureContext) throw new Error("カメラを使うにはHTTPSまたはlocalhostで開いてください。");
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error("このブラウザではカメラを利用できません。");
+        setStatus("カメラへのアクセスを待っています。");
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false,
+        });
+        try {
+          cameraVideo.srcObject = cameraStream;
+          cameraVideo.hidden = false;
+          if (cameraVideo.readyState < 1) {
+            await new Promise((resolve, reject) => {
+              cameraVideo.addEventListener("loadedmetadata", resolve, { once: true });
+              cameraVideo.addEventListener("error", () => reject(new Error("カメラ映像を読み込めませんでした。")), { once: true });
+            });
+          }
+          await cameraVideo.play();
+          if (!cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+            throw new Error("カメラ映像のサイズを取得できませんでした。");
+          }
+          resetPhoto();
+          setStatus("カメラを起動しました。撮影してください。");
+        } catch (error) {
+          stopCamera();
+          throw error;
+        }
+      }
+
+      function stopCamera() {
+        if (cameraStream) {
+          for (const track of cameraStream.getTracks()) track.stop();
+          cameraStream = undefined;
+        }
+        cameraVideo.pause();
+        cameraVideo.srcObject = null;
+        cameraVideo.hidden = true;
+        updateControls();
+      }
+
+      function captureCameraFrame() {
+        if (!cameraStream || !cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+          throw new Error("撮影できるカメラ映像がありません。");
+        }
+        const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(cameraVideo.videoWidth, cameraVideo.videoHeight));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(cameraVideo.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(cameraVideo.videoHeight * scale));
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("撮影画像を描画するCanvas 2D contextを取得できませんでした。");
+        context.drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
+        setPhoto(canvas);
+        stopCamera();
+        setStatus("撮影しました。残したい物を写真上でクリックしてください。");
+      }
+
+      imageInput.addEventListener("change", () => runExclusive(async () => {
+        stopCamera();
+        resetPhoto();
+        const file = imageInput.files?.[0];
+        if (!file) {
+          setStatus("写真を選択または撮影してください。");
+          return;
+        }
+        const canvas = await fileToCanvas(file);
+        setPhoto(canvas);
+        setStatus("写真を読み込みました。残したい物をクリックしてください。");
+      }));
+
+      sourceView.addEventListener("click", (event) => runExclusive(async () => {
+        if (!imageReady) throw new Error("先に写真を選択または撮影してください。");
+        const rect = sourceView.getBoundingClientRect();
+        const point = {
+          x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+          y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+          label: Number(document.querySelector('input[name="point-mode"]:checked').value),
+        };
+        if (point.label === 0 && !points.some((item) => item.label === 1)) {
+          throw new Error("最初に残したい物を選択する点でクリックしてください。");
+        }
+
+        await ensureImageEmbeddings();
+        points.push(point);
+        drawSourceView();
+        await decodeMask();
+      }));
+
+      clearPointsButton.addEventListener("click", () => {
+        points.length = 0;
+        clearMask();
+        drawSourceView();
+        updateControls();
+        setStatus("選択点をクリアしました。写真をクリックして選び直してください。");
+      });
+
+      downloadButton.addEventListener("click", () => runExclusive(async () => {
+        if (!hasMask) return;
+        try {
+          const blob = await new Promise((resolve, reject) => {
+            cutoutResult.toBlob(
+              (value) => value ? resolve(value) : reject(new Error("PNGを作成できませんでした。")),
+              "image/png",
+            );
+          });
+          const url = URL.createObjectURL(blob);
+          downloadObjectUrls.push(url);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = "cutout.png";
+          document.body.append(link);
+          link.click();
+          link.remove();
+          window.setTimeout(() => {
+            URL.revokeObjectURL(url);
+            const index = downloadObjectUrls.indexOf(url);
+            if (index !== -1) downloadObjectUrls.splice(index, 1);
+          }, 1000);
+          setStatus("透明背景のPNGをダウンロードしました。");
+        } catch (error) {
+          console.error(error);
+          setStatus(`ダウンロードできませんでした: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }));
+
+      cameraStartButton.addEventListener("click", () => runExclusive(startCamera));
+      cameraCaptureButton.addEventListener("click", () => {
+        try {
+          captureCameraFrame();
+        } catch (error) {
+          console.error(error);
+          stopCamera();
+          setStatus(`撮影できませんでした: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+
+      window.addEventListener("pagehide", () => {
+        stopCamera();
+        clearImageEmbeddings();
+        samModel?.dispose?.();
+        for (const url of downloadObjectUrls) URL.revokeObjectURL(url);
+      });
+    </script>
+  </body>
+</html>

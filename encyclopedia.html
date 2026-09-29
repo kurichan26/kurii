@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>自分だけの暮らし図鑑</title>
+  </head>
+  <body>
+    <main>
+      <h1>自分だけの暮らし図鑑</h1>
+      <p>写真に写った身近な物を見つけ、日々の発見を自分だけの図鑑に記録します。</p>
+      <p>物体検出はWebGPUで行います。写真と記録はこのブラウザ内に保存します。認識対象はモデルが対応する一般物体カテゴリです。</p>
+      <p><a href="./finder.html">図鑑の写真から探し物をする</a></p>
+
+      <p>
+        <label for="image-file">画像を選択:</label>
+        <input id="image-file" type="file" accept="image/*" />
+      </p>
+      <p>
+        <button id="camera-start" type="button">カメラを起動</button>
+        <button id="camera-capture" type="button" disabled>撮影</button>
+      </p>
+      <video id="camera-preview" autoplay muted playsinline hidden></video>
+      <p>
+        <label for="threshold">信頼度しきい値:</label>
+        <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.4" />
+      </p>
+      <button id="detect-button" type="button" disabled>物体を検出</button>
+      <p id="status" role="status" aria-live="polite">画像を選択してください。</p>
+
+      <canvas id="preview" hidden aria-label="物体検出結果"></canvas>
+      <h2>今回見つけたもの</h2>
+      <ul id="counts"></ul>
+      <h2>検出内容</h2>
+      <ul id="detections"></ul>
+      <button id="record-button" type="button" disabled>図鑑に記録</button>
+
+      <section aria-labelledby="encyclopedia-heading">
+        <h2 id="encyclopedia-heading">自分だけの暮らし図鑑</h2>
+        <p id="collection-summary">図鑑を読み込んでいます。</p>
+        <p id="collection-status" role="status" aria-live="polite">写真と記録はこのブラウザに保存されます。</p>
+        <ol id="collection"></ol>
+      </section>
+    </main>
+
+    <script type="module">
+      import {
+        AutoModel,
+        AutoProcessor,
+        RawImage,
+        env,
+      } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+
+      env.allowLocalModels = false;
+
+      const MODEL_ID = "onnx-community/yolov10n";
+      const MAX_IMAGE_SIDE = 960;
+      const DB_NAME = "kurii-life-encyclopedia";
+      const DB_VERSION = 1;
+      const STORE_NAME = "observations";
+      const JAPANESE_LABELS = new Map([
+        ["person", "人"], ["bicycle", "自転車"], ["car", "車"], ["motorcycle", "バイク"],
+        ["airplane", "飛行機"], ["bus", "バス"], ["train", "電車"], ["truck", "トラック"],
+        ["boat", "ボート"], ["traffic light", "信号機"], ["fire hydrant", "消火栓"],
+        ["stop sign", "一時停止標識"], ["parking meter", "パーキングメーター"], ["bench", "ベンチ"],
+        ["bird", "鳥"], ["cat", "猫"], ["dog", "犬"], ["horse", "馬"], ["sheep", "羊"],
+        ["cow", "牛"], ["elephant", "ゾウ"], ["bear", "クマ"], ["zebra", "シマウマ"],
+        ["giraffe", "キリン"], ["backpack", "リュック"], ["umbrella", "傘"],
+        ["handbag", "ハンドバッグ"], ["tie", "ネクタイ"], ["suitcase", "スーツケース"],
+        ["frisbee", "フリスビー"], ["skis", "スキー板"], ["snowboard", "スノーボード"],
+        ["sports ball", "ボール"], ["kite", "たこ"], ["baseball bat", "野球バット"],
+        ["baseball glove", "野球グローブ"], ["skateboard", "スケートボード"],
+        ["surfboard", "サーフボード"], ["tennis racket", "テニスラケット"],
+        ["bottle", "ボトル"], ["wine glass", "ワイングラス"], ["cup", "カップ"],
+        ["fork", "フォーク"], ["knife", "ナイフ"], ["spoon", "スプーン"], ["bowl", "ボウル"],
+        ["banana", "バナナ"], ["apple", "りんご"], ["sandwich", "サンドイッチ"],
+        ["orange", "オレンジ"], ["broccoli", "ブロッコリー"], ["carrot", "にんじん"],
+        ["hot dog", "ホットドッグ"], ["pizza", "ピザ"], ["donut", "ドーナツ"], ["cake", "ケーキ"],
+        ["chair", "椅子"], ["couch", "ソファ"], ["potted plant", "鉢植え"], ["bed", "ベッド"],
+        ["dining table", "ダイニングテーブル"], ["toilet", "トイレ"], ["tv", "テレビ"],
+        ["laptop", "ノートパソコン"], ["mouse", "マウス"], ["remote", "リモコン"],
+        ["keyboard", "キーボード"], ["cell phone", "スマートフォン"], ["microwave", "電子レンジ"],
+        ["oven", "オーブン"], ["toaster", "トースター"], ["sink", "シンク"],
+        ["refrigerator", "冷蔵庫"], ["book", "本"], ["clock", "時計"], ["vase", "花瓶"],
+        ["scissors", "はさみ"], ["teddy bear", "ぬいぐるみ"], ["hair drier", "ドライヤー"],
+        ["toothbrush", "歯ブラシ"],
+      ]);
+      const imageInput = document.querySelector("#image-file");
+      const cameraStartButton = document.querySelector("#camera-start");
+      const cameraCaptureButton = document.querySelector("#camera-capture");
+      const cameraVideo = document.querySelector("#camera-preview");
+      const thresholdInput = document.querySelector("#threshold");
+      const detectButton = document.querySelector("#detect-button");
+      const recordButton = document.querySelector("#record-button");
+      const statusElement = document.querySelector("#status");
+      const preview = document.querySelector("#preview");
+      const countsList = document.querySelector("#counts");
+      const detectionsList = document.querySelector("#detections");
+      const collectionSummary = document.querySelector("#collection-summary");
+      const collectionStatus = document.querySelector("#collection-status");
+      const collectionList = document.querySelector("#collection");
+      const inputCanvas = document.createElement("canvas");
+      let model;
+      let processor;
+      let modelLoadPromise;
+      let imageReady = false;
+      let busy = false;
+      let cameraBusy = false;
+      let cameraStream;
+      let databasePromise;
+      let latestDetections = [];
+      let inferenceReady = false;
+      const collectionObjectUrls = [];
+
+      function setStatus(message) {
+        statusElement.textContent = message;
+      }
+
+      function updateCameraButtons() {
+        const controlsBusy = busy || cameraBusy || imageInput.disabled;
+        cameraStartButton.disabled = controlsBusy || Boolean(cameraStream);
+        cameraCaptureButton.disabled =
+          controlsBusy || !cameraStream || cameraVideo.videoWidth === 0 || cameraVideo.videoHeight === 0;
+      }
+
+      function stopCamera() {
+        if (cameraStream) {
+          for (const track of cameraStream.getTracks()) {
+            track.stop();
+          }
+          cameraStream = undefined;
+        }
+        cameraVideo.pause();
+        cameraVideo.srcObject = null;
+        cameraVideo.hidden = true;
+        updateCameraButtons();
+      }
+
+      async function startCamera() {
+        if (busy || cameraBusy) return;
+        cameraBusy = true;
+        imageInput.disabled = true;
+        detectButton.disabled = true;
+        updateCameraButtons();
+
+        try {
+          if (!window.isSecureContext) {
+            throw new Error("カメラを使うにはHTTPSまたはlocalhostでページを開いてください。");
+          }
+          if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error("このブラウザではカメラを利用できません。");
+          }
+
+          setStatus("カメラへのアクセスを待っています。");
+          cameraStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: "environment" } },
+            audio: false,
+          });
+          try {
+            cameraVideo.srcObject = cameraStream;
+            cameraVideo.hidden = false;
+            if (cameraVideo.readyState < 1) {
+              await new Promise((resolve, reject) => {
+                cameraVideo.addEventListener("loadedmetadata", resolve, { once: true });
+                cameraVideo.addEventListener(
+                  "error",
+                  () => reject(new Error("カメラ映像を読み込めませんでした。")),
+                  { once: true },
+                );
+              });
+            }
+            await cameraVideo.play();
+            if (!cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+              throw new Error("カメラ映像のサイズを取得できませんでした。");
+            }
+
+            imageReady = false;
+            clearResults();
+            preview.hidden = true;
+            setStatus("カメラを起動しました。撮影してください。");
+          } catch (error) {
+            stopCamera();
+            throw error;
+          }
+        } finally {
+          cameraBusy = false;
+          imageInput.disabled = false;
+          detectButton.disabled = !imageReady;
+          updateCameraButtons();
+        }
+      }
+
+      function captureCameraFrame() {
+        if (!cameraStream || !cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+          throw new Error("撮影できるカメラ映像がありません。");
+        }
+
+        const scale = Math.min(
+          1,
+          MAX_IMAGE_SIDE / Math.max(cameraVideo.videoWidth, cameraVideo.videoHeight),
+        );
+        inputCanvas.width = Math.max(1, Math.round(cameraVideo.videoWidth * scale));
+        inputCanvas.height = Math.max(1, Math.round(cameraVideo.videoHeight * scale));
+        const inputContext = inputCanvas.getContext("2d");
+        if (!inputContext) {
+          throw new Error("撮影画像を描画するCanvas 2D contextを取得できませんでした。");
+        }
+        inputContext.drawImage(cameraVideo, 0, 0, inputCanvas.width, inputCanvas.height);
+
+        preview.width = inputCanvas.width;
+        preview.height = inputCanvas.height;
+        const previewContext = preview.getContext("2d");
+        if (!previewContext) {
+          throw new Error("撮影画像を表示するCanvas 2D contextを取得できませんでした。");
+        }
+        previewContext.drawImage(inputCanvas, 0, 0);
+        preview.hidden = false;
+        imageReady = true;
+        clearResults();
+        stopCamera();
+        detectButton.disabled = false;
+        setStatus(`撮影しました (${inputCanvas.width} × ${inputCanvas.height})。`);
+      }
+
+      async function requireWebGPU() {
+        if (!navigator.gpu) {
+          throw new Error("WebGPU が利用できません。WebGPU 対応ブラウザで開いてください。");
+        }
+
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+          throw new Error("WebGPU adapter を取得できませんでした。");
+        }
+
+        return adapter;
+      }
+
+      async function fileToCanvas(file, maxSide = MAX_IMAGE_SIDE) {
+        const url = URL.createObjectURL(file);
+        const image = new Image();
+
+        try {
+          image.src = url;
+          await image.decode();
+
+          const scale = Math.min(
+            1,
+            maxSide / Math.max(image.naturalWidth, image.naturalHeight),
+          );
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+
+          const context = canvas.getContext("2d");
+          if (!context) {
+            throw new Error("画像を描画するCanvas 2D contextを取得できませんでした。");
+          }
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          return canvas;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+
+      function openDatabase() {
+        if (!window.indexedDB) {
+          return Promise.reject(new Error("このブラウザでは図鑑を保存できません。") );
+        }
+        if (!databasePromise) {
+          databasePromise = new Promise((resolve, reject) => {
+            const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+            request.onupgradeneeded = () => {
+              const database = request.result;
+              if (!database.objectStoreNames.contains(STORE_NAME)) {
+                database.createObjectStore(STORE_NAME, { keyPath: "id" });
+              }
+            };
+            request.onsuccess = () => {
+              const database = request.result;
+              database.onversionchange = () => database.close();
+              resolve(database);
+            };
+            request.onerror = () => reject(request.error ?? new Error("図鑑を開けませんでした。"));
+          }).catch((error) => {
+            databasePromise = undefined;
+            throw error;
+          });
+        }
+        return databasePromise;
+      }
+
+      async function getObservations() {
+        const database = await openDatabase();
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(STORE_NAME, "readonly");
+          const request = transaction.objectStore(STORE_NAME).getAll();
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error ?? new Error("図鑑を読み込めませんでした。"));
+        });
+      }
+
+      async function writeObservation(record) {
+        const database = await openDatabase();
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(STORE_NAME, "readwrite");
+          transaction.objectStore(STORE_NAME).put(record);
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error ?? new Error("図鑑に記録できませんでした。"));
+          transaction.onabort = () => reject(transaction.error ?? new Error("図鑑への記録が中断されました。"));
+        });
+      }
+
+      async function deleteObservation(id) {
+        const database = await openDatabase();
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(STORE_NAME, "readwrite");
+          transaction.objectStore(STORE_NAME).delete(id);
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error ?? new Error("記録を削除できませんでした。"));
+          transaction.onabort = () => reject(transaction.error ?? new Error("記録の削除が中断されました。"));
+        });
+      }
+
+      function canvasToBlob(canvas) {
+        return new Promise((resolve, reject) => {
+          canvas.toBlob(
+            (blob) => blob ? resolve(blob) : reject(new Error("写真を保存用データに変換できませんでした。")),
+            "image/jpeg",
+            0.86,
+          );
+        });
+      }
+
+      async function refreshCollection() {
+        const records = await getObservations();
+        const labels = new Set();
+        for (const record of records) {
+          for (const item of record.items ?? []) labels.add(item.label);
+        }
+        collectionSummary.textContent = `見つけた種類: ${labels.size} / ${JAPANESE_LABELS.size}　撮影記録: ${records.length}件`;
+
+        for (const url of collectionObjectUrls) URL.revokeObjectURL(url);
+        collectionObjectUrls.length = 0;
+        collectionList.replaceChildren();
+
+        const orderedRecords = records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        if (orderedRecords.length === 0) {
+          const item = document.createElement("li");
+          item.textContent = "まだ記録はありません。写真を撮影または選択し、図鑑に記録してください。";
+          collectionList.append(item);
+          return;
+        }
+
+        for (const record of orderedRecords.slice(0, 20)) {
+          const listItem = document.createElement("li");
+          const image = document.createElement("img");
+          image.src = URL.createObjectURL(record.photo);
+          image.width = 160;
+          image.alt = "暮らし図鑑に記録した写真";
+          image.loading = "lazy";
+          collectionObjectUrls.push(image.src);
+          listItem.append(image);
+
+          const counts = new Map();
+          for (const detection of record.items ?? []) {
+            counts.set(detection.label, (counts.get(detection.label) ?? 0) + 1);
+          }
+          const date = new Date(record.createdAt).toLocaleString("ja-JP");
+          const description = counts.size
+            ? [...counts].map(([label, count]) => `${label} ${count}個`).join("、")
+            : "見つけたものはありません";
+          const caption = document.createElement("p");
+          caption.textContent = `${date} — ${description}`;
+          listItem.append(caption);
+
+          const deleteButton = document.createElement("button");
+          deleteButton.type = "button";
+          deleteButton.textContent = "この記録を削除";
+          deleteButton.addEventListener("click", async () => {
+            deleteButton.disabled = true;
+            try {
+              await deleteObservation(record.id);
+              await refreshCollection();
+              collectionStatus.textContent = "記録を削除しました。";
+            } catch (error) {
+              console.error(error);
+              deleteButton.disabled = false;
+              collectionStatus.textContent = `削除できませんでした: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          });
+          listItem.append(deleteButton);
+          collectionList.append(listItem);
+        }
+      }
+
+      function clearResults() {
+        countsList.replaceChildren();
+        detectionsList.replaceChildren();
+        recordButton.disabled = true;
+        latestDetections = [];
+        inferenceReady = false;
+      }
+
+      function disposeTensorTree(value, seen = new Set()) {
+        if (!value || typeof value !== "object" || seen.has(value)) return;
+        seen.add(value);
+
+        if (typeof value.dispose === "function") {
+          value.dispose();
+          return;
+        }
+
+        if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
+        if (Array.isArray(value)) {
+          for (const item of value) disposeTensorTree(item, seen);
+          return;
+        }
+
+        for (const item of Object.values(value)) {
+          disposeTensorTree(item, seen);
+        }
+      }
+
+      async function ensureModel() {
+        if (model && processor) return;
+        if (!modelLoadPromise) {
+          modelLoadPromise = (async () => {
+            setStatus("YOLOv10モデルを読み込んでいます。初回はダウンロードに時間がかかります。");
+            const progressCallback = (event) => {
+              if (event.status === "progress" && Number.isFinite(event.progress)) {
+                const file = event.file ? ` (${event.file})` : "";
+                setStatus(`モデルをダウンロード中: ${event.progress.toFixed(0)}%${file}`);
+              }
+            };
+
+            const loadedProcessor = await AutoProcessor.from_pretrained(MODEL_ID);
+            const loadedModel = await AutoModel.from_pretrained(MODEL_ID, {
+              device: "webgpu",
+              dtype: "q8",
+              progress_callback: progressCallback,
+            });
+            model = loadedModel;
+            processor = loadedProcessor;
+          })().catch((error) => {
+            modelLoadPromise = undefined;
+            throw error;
+          });
+        }
+
+        await modelLoadPromise;
+      }
+
+      function readDetections(output0, resizedSize, threshold) {
+        if (!output0 || !Array.isArray(output0.dims)) {
+          throw new Error("YOLOv10の出力Tensorを取得できませんでした。");
+        }
+        const dims = output0.dims;
+        if (dims[dims.length - 1] !== 6 || (dims.length !== 2 && dims.length !== 3)) {
+          throw new Error(`YOLOv10の出力shapeが想定外です: [${dims.join(", ")}]`);
+        }
+        if (dims.length === 3 && dims[0] !== 1) {
+          throw new Error(`YOLOv10のbatch sizeが想定外です: ${dims[0]}`);
+        }
+
+        const [resizedHeight, resizedWidth] = resizedSize;
+        if (!resizedHeight || !resizedWidth) {
+          throw new Error("画像の前処理後サイズを取得できませんでした。");
+        }
+
+        const scaleX = inputCanvas.width / resizedWidth;
+        const scaleY = inputCanvas.height / resizedHeight;
+        const values = output0.data;
+        const detections = [];
+
+        for (let offset = 0; offset < values.length; offset += 6) {
+          const [xmin, ymin, xmax, ymax, score, rawClassId] = values.subarray
+            ? values.subarray(offset, offset + 6)
+            : values.slice(offset, offset + 6);
+          if (!Number.isFinite(score) || score < threshold) continue;
+          if (![xmin, ymin, xmax, ymax, rawClassId].every(Number.isFinite)) continue;
+
+          const classId = Math.round(rawClassId);
+          const modelLabel = model.config.id2label?.[classId] ?? `class ${classId}`;
+          const label = JAPANESE_LABELS.get(modelLabel.trim().toLowerCase()) ?? modelLabel;
+          const x = Math.max(0, Math.min(inputCanvas.width, xmin * scaleX));
+          const y = Math.max(0, Math.min(inputCanvas.height, ymin * scaleY));
+          const right = Math.max(x, Math.min(inputCanvas.width, xmax * scaleX));
+          const bottom = Math.max(y, Math.min(inputCanvas.height, ymax * scaleY));
+          detections.push({ label, score, x, y, width: right - x, height: bottom - y });
+        }
+
+        return detections;
+      }
+
+      function showDetections(detections) {
+        preview.width = inputCanvas.width;
+        preview.height = inputCanvas.height;
+        preview.hidden = false;
+
+        const context = preview.getContext("2d");
+        if (!context) {
+          throw new Error("結果を描画するCanvas 2D contextを取得できませんでした。");
+        }
+        context.drawImage(inputCanvas, 0, 0);
+        context.strokeStyle = "red";
+        context.fillStyle = "red";
+        context.lineWidth = Math.max(2, inputCanvas.width / 400);
+        context.font = `${Math.max(14, inputCanvas.width / 50)}px sans-serif`;
+
+        if (detections.length === 0) {
+          const item = document.createElement("li");
+          item.textContent = "認識できる物は見つかりませんでした。";
+          countsList.append(item);
+          return;
+        }
+
+        const counts = new Map();
+        for (const detection of detections) {
+          counts.set(detection.label, (counts.get(detection.label) ?? 0) + 1);
+          context.strokeRect(detection.x, detection.y, detection.width, detection.height);
+          context.fillText(
+            `${detection.label} ${(detection.score * 100).toFixed(0)}%`,
+            detection.x,
+            Math.max(14, detection.y - 4),
+          );
+
+          const item = document.createElement("li");
+          item.textContent = `${detection.label}: 信頼度 ${(detection.score * 100).toFixed(1)}%`;
+          detectionsList.append(item);
+        }
+
+        for (const [label, count] of counts) {
+          const item = document.createElement("li");
+          item.textContent = `${label}: ${count}個`;
+          countsList.append(item);
+        }
+      }
+
+      async function runExclusive(task) {
+        if (busy || cameraBusy) return;
+        busy = true;
+        imageInput.disabled = true;
+        detectButton.disabled = true;
+        recordButton.disabled = true;
+        updateCameraButtons();
+
+        try {
+          await task();
+        } catch (error) {
+          console.error(error);
+          setStatus(`エラー: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          busy = false;
+          imageInput.disabled = false;
+          detectButton.disabled = !imageReady;
+          recordButton.disabled = !inferenceReady;
+          updateCameraButtons();
+        }
+      }
+
+      imageInput.addEventListener("change", async () => {
+        stopCamera();
+        const file = imageInput.files?.[0];
+        imageReady = false;
+        detectButton.disabled = true;
+        clearResults();
+        preview.hidden = true;
+
+        if (!file) {
+          preview.hidden = true;
+          setStatus("画像を選択してください。");
+          return;
+        }
+
+        imageInput.disabled = true;
+        updateCameraButtons();
+        setStatus("画像を読み込んでいます。");
+        try {
+          const canvas = await fileToCanvas(file);
+          inputCanvas.width = canvas.width;
+          inputCanvas.height = canvas.height;
+          const inputContext = inputCanvas.getContext("2d");
+          const previewContext = preview.getContext("2d");
+          if (!inputContext || !previewContext) {
+            throw new Error("画像を描画するCanvas 2D contextを取得できませんでした。");
+          }
+          inputContext.drawImage(canvas, 0, 0);
+          preview.width = canvas.width;
+          preview.height = canvas.height;
+          previewContext.drawImage(canvas, 0, 0);
+          preview.hidden = false;
+          imageReady = true;
+          setStatus(`画像を読み込みました (${canvas.width} × ${canvas.height})。`);
+        } catch (error) {
+          console.error(error);
+          setStatus(`画像を読み込めませんでした: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          imageInput.disabled = false;
+          detectButton.disabled = !imageReady;
+          updateCameraButtons();
+        }
+      });
+
+      cameraStartButton.addEventListener("click", async () => {
+        try {
+          await startCamera();
+        } catch (error) {
+          console.error(error);
+          stopCamera();
+          setStatus(`カメラを利用できません: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+
+      cameraCaptureButton.addEventListener("click", () => {
+        try {
+          captureCameraFrame();
+        } catch (error) {
+          console.error(error);
+          stopCamera();
+          setStatus(`撮影できませんでした: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+
+      recordButton.addEventListener("click", () => runExclusive(async () => {
+        if (!imageReady || !inferenceReady) {
+          throw new Error("先に写真を選んで物体を検出してください。");
+        }
+
+        const record = {
+          id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          createdAt: new Date().toISOString(),
+          photo: await canvasToBlob(inputCanvas),
+          items: latestDetections,
+        };
+        await writeObservation(record);
+        inferenceReady = false;
+        await refreshCollection();
+        collectionStatus.textContent = "図鑑に記録しました。このデータはこのブラウザ内に保存されています。";
+        setStatus("写真と認識結果を暮らし図鑑に記録しました。");
+      }));
+
+      detectButton.addEventListener("click", () => runExclusive(async () => {
+        if (!imageReady) {
+          throw new Error("先に画像を選択してください。");
+        }
+
+        const threshold = Number(thresholdInput.value);
+        if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+          throw new Error("信頼度しきい値は0から1の範囲で入力してください。");
+        }
+
+        clearResults();
+        await requireWebGPU();
+        await ensureModel();
+
+        let processed;
+        let outputs;
+        try {
+          setStatus("画像を解析しています。");
+          const rawImage = RawImage.fromCanvas(inputCanvas);
+          processed = await processor(rawImage);
+          outputs = await model({ images: processed.pixel_values });
+          const resizedSize = processed.reshaped_input_sizes?.[0];
+          const detections = readDetections(outputs.output0, resizedSize, threshold);
+          showDetections(detections);
+          latestDetections = detections.map(({ label, score }) => ({ label, score }));
+          inferenceReady = true;
+          recordButton.disabled = false;
+          setStatus(`検出完了: ${detections.length}件。図鑑に残す場合は「図鑑に記録」を押してください。`);
+        } finally {
+          disposeTensorTree(outputs);
+          disposeTensorTree(processed);
+        }
+      }));
+
+      refreshCollection().catch((error) => {
+        console.error(error);
+        collectionSummary.textContent = "図鑑を読み込めませんでした。";
+        collectionStatus.textContent = error instanceof Error ? error.message : String(error);
+      });
+
+      window.addEventListener("pagehide", () => {
+        stopCamera();
+        model?.dispose?.();
+        for (const url of collectionObjectUrls) URL.revokeObjectURL(url);
+      });
+    </script>
+  </body>
+</html>

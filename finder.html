@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>写真から探し物</title>
+  </head>
+  <body>
+    <main>
+      <h1>写真から探し物</h1>
+      <p>暮らし図鑑に記録した写真から、探している物が最後に写っていた場所を見つけます。</p>
+      <p><a href="./encyclopedia.html">暮らし図鑑に写真を記録する</a></p>
+
+      <p>
+        <label for="object-select">探すもの:</label>
+        <select id="object-select" disabled>
+          <option value="">記録を読み込んでいます。</option>
+        </select>
+        <button id="search-button" type="button" disabled>写真を探す</button>
+      </p>
+      <p id="status" role="status" aria-live="polite">図鑑の記録を読み込んでいます。</p>
+      <ol id="results"></ol>
+    </main>
+
+    <script type="module">
+      const DB_NAME = "kurii-life-encyclopedia";
+      const DB_VERSION = 1;
+      const STORE_NAME = "observations";
+      const objectSelect = document.querySelector("#object-select");
+      const searchButton = document.querySelector("#search-button");
+      const statusElement = document.querySelector("#status");
+      const resultsList = document.querySelector("#results");
+      const objectUrls = [];
+      let records = [];
+
+      function openDatabase() {
+        if (!window.indexedDB) {
+          return Promise.reject(new Error("このブラウザでは図鑑を読み込めません。"));
+        }
+
+        return new Promise((resolve, reject) => {
+          const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+          request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(STORE_NAME)) {
+              database.createObjectStore(STORE_NAME, { keyPath: "id" });
+            }
+          };
+          request.onsuccess = () => {
+            const database = request.result;
+            database.onversionchange = () => database.close();
+            resolve(database);
+          };
+          request.onerror = () => reject(request.error ?? new Error("図鑑を開けませんでした。"));
+        });
+      }
+
+      async function readRecords() {
+        const database = await openDatabase();
+        return new Promise((resolve, reject) => {
+          const transaction = database.transaction(STORE_NAME, "readonly");
+          const request = transaction.objectStore(STORE_NAME).getAll();
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error ?? new Error("図鑑の記録を読み込めませんでした。"));
+        });
+      }
+
+      function clearResults() {
+        for (const url of objectUrls) URL.revokeObjectURL(url);
+        objectUrls.length = 0;
+        resultsList.replaceChildren();
+      }
+
+      function searchForObject() {
+        const label = objectSelect.value;
+        clearResults();
+        if (!label) {
+          statusElement.textContent = "探すものを選んでください。";
+          return;
+        }
+
+        const matches = records.flatMap((record) => {
+          const count = (record.items ?? []).filter((item) => item.label === label).length;
+          return count ? [{ record, count }] : [];
+        }).sort((a, b) => b.record.createdAt.localeCompare(a.record.createdAt));
+
+        if (matches.length === 0) {
+          statusElement.textContent = `${label}が写っている写真は見つかりませんでした。`;
+          return;
+        }
+
+        for (const { record, count } of matches.slice(0, 20)) {
+          const listItem = document.createElement("li");
+          const image = document.createElement("img");
+          image.src = URL.createObjectURL(record.photo);
+          image.width = 240;
+          image.loading = "lazy";
+          const date = new Date(record.createdAt).toLocaleString("ja-JP");
+          image.alt = `${date}に${label}が写っている写真`;
+          objectUrls.push(image.src);
+
+          const caption = document.createElement("p");
+          caption.textContent = `${date} — ${label} ${count}個`;
+          listItem.append(image, caption);
+          resultsList.append(listItem);
+        }
+
+        const shown = Math.min(matches.length, 20);
+        statusElement.textContent = `最後に写っていた記録が上に表示されています。${matches.length}件中${shown}件を表示中です。`;
+      }
+
+      searchButton.addEventListener("click", searchForObject);
+
+      readRecords().then((loadedRecords) => {
+        records = loadedRecords;
+        const labels = [...new Set(records.flatMap((record) =>
+          (record.items ?? []).map((item) => item.label),
+        ))].sort((a, b) => a.localeCompare(b, "ja"));
+
+        objectSelect.replaceChildren();
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = labels.length ? "物を選択してください" : "図鑑に記録がありません";
+        objectSelect.append(placeholder);
+        for (const label of labels) {
+          const option = document.createElement("option");
+          option.value = label;
+          option.textContent = label;
+          objectSelect.append(option);
+        }
+
+        objectSelect.disabled = labels.length === 0;
+        searchButton.disabled = labels.length === 0;
+        statusElement.textContent = labels.length
+          ? `写真${records.length}件、${labels.length}種類の記録があります。`
+          : "まず暮らし図鑑に写真を記録してください。";
+      }).catch((error) => {
+        console.error(error);
+        statusElement.textContent = `図鑑を読み込めませんでした: ${error instanceof Error ? error.message : String(error)}`;
+      });
+
+      window.addEventListener("pagehide", clearResults);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>画像認識デモ</title>
+  </head>
+  <body>
+    <main>
+      <h1>画像認識デモ</h1>
+      <p>写真に写った食品を確認します。推論にはWebGPUを使用します。</p>
+      <p>認識対象: バナナ、りんご、サンドイッチ、オレンジ、ブロッコリー、にんじん、ホットドッグ、ピザ、ドーナツ、ケーキ</p>
+      <p><a href="./encyclopedia.html">自分だけの暮らし図鑑を開く</a></p>
+      <p><a href="./cutout.html">写真からステッカーを作る</a></p>
+
+      <p>
+        <label for="image-file">画像を選択:</label>
+        <input id="image-file" type="file" accept="image/*" />
+      </p>
+      <p>
+        <button id="camera-start" type="button">カメラを起動</button>
+        <button id="camera-capture" type="button" disabled>撮影</button>
+      </p>
+      <video id="camera-preview" autoplay muted playsinline hidden></video>
+      <p>
+        <label for="threshold">信頼度しきい値:</label>
+        <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.4" />
+      </p>
+      <button id="detect-button" type="button" disabled>物体を検出</button>
+      <p id="status" role="status" aria-live="polite">画像を選択してください。</p>
+
+      <canvas id="preview" hidden aria-label="物体検出結果"></canvas>
+      <h2>確認できた食材</h2>
+      <ul id="counts"></ul>
+      <h2>検出内容</h2>
+      <ul id="detections"></ul>
+    </main>
+
+    <script type="module">
+      import {
+        AutoModel,
+        AutoProcessor,
+        RawImage,
+        env,
+      } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+
+      env.allowLocalModels = false;
+
+      const MODEL_ID = "onnx-community/yolov10n";
+      const MAX_IMAGE_SIDE = 960;
+      const FOOD_LABELS = new Map([
+        ["banana", "バナナ"],
+        ["apple", "りんご"],
+        ["sandwich", "サンドイッチ"],
+        ["orange", "オレンジ"],
+        ["broccoli", "ブロッコリー"],
+        ["carrot", "にんじん"],
+        ["hot dog", "ホットドッグ"],
+        ["pizza", "ピザ"],
+        ["donut", "ドーナツ"],
+        ["doughnut", "ドーナツ"],
+        ["cake", "ケーキ"],
+      ]);
+      const imageInput = document.querySelector("#image-file");
+      const cameraStartButton = document.querySelector("#camera-start");
+      const cameraCaptureButton = document.querySelector("#camera-capture");
+      const cameraVideo = document.querySelector("#camera-preview");
+      const thresholdInput = document.querySelector("#threshold");
+      const detectButton = document.querySelector("#detect-button");
+      const statusElement = document.querySelector("#status");
+      const preview = document.querySelector("#preview");
+      const countsList = document.querySelector("#counts");
+      const detectionsList = document.querySelector("#detections");
+      const inputCanvas = document.createElement("canvas");
+      let model;
+      let processor;
+      let modelLoadPromise;
+      let imageReady = false;
+      let busy = false;
+      let cameraBusy = false;
+      let cameraStream;
+
+      function setStatus(message) {
+        statusElement.textContent = message;
+      }
+
+      function updateCameraButtons() {
+        const controlsBusy = busy || cameraBusy || imageInput.disabled;
+        cameraStartButton.disabled = controlsBusy || Boolean(cameraStream);
+        cameraCaptureButton.disabled =
+          controlsBusy || !cameraStream || cameraVideo.videoWidth === 0 || cameraVideo.videoHeight === 0;
+      }
+
+      function stopCamera() {
+        if (cameraStream) {
+          for (const track of cameraStream.getTracks()) {
+            track.stop();
+          }
+          cameraStream = undefined;
+        }
+        cameraVideo.pause();
+        cameraVideo.srcObject = null;
+        cameraVideo.hidden = true;
+        updateCameraButtons();
+      }
+
+      async function startCamera() {
+        if (busy || cameraBusy) return;
+        cameraBusy = true;
+        imageInput.disabled = true;
+        detectButton.disabled = true;
+        updateCameraButtons();
+
+        try {
+          if (!window.isSecureContext) {
+            throw new Error("カメラを使うにはHTTPSまたはlocalhostでページを開いてください。");
+          }
+          if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error("このブラウザではカメラを利用できません。");
+          }
+
+          setStatus("カメラへのアクセスを待っています。");
+          cameraStream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: "environment" } },
+            audio: false,
+          });
+          try {
+            cameraVideo.srcObject = cameraStream;
+            cameraVideo.hidden = false;
+            if (cameraVideo.readyState < 1) {
+              await new Promise((resolve, reject) => {
+                cameraVideo.addEventListener("loadedmetadata", resolve, { once: true });
+                cameraVideo.addEventListener(
+                  "error",
+                  () => reject(new Error("カメラ映像を読み込めませんでした。")),
+                  { once: true },
+                );
+              });
+            }
+            await cameraVideo.play();
+            if (!cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+              throw new Error("カメラ映像のサイズを取得できませんでした。");
+            }
+
+            imageReady = false;
+            clearResults();
+            preview.hidden = true;
+            setStatus("カメラを起動しました。撮影してください。");
+          } catch (error) {
+            stopCamera();
+            throw error;
+          }
+        } finally {
+          cameraBusy = false;
+          imageInput.disabled = false;
+          detectButton.disabled = !imageReady;
+          updateCameraButtons();
+        }
+      }
+
+      function captureCameraFrame() {
+        if (!cameraStream || !cameraVideo.videoWidth || !cameraVideo.videoHeight) {
+          throw new Error("撮影できるカメラ映像がありません。");
+        }
+
+        const scale = Math.min(
+          1,
+          MAX_IMAGE_SIDE / Math.max(cameraVideo.videoWidth, cameraVideo.videoHeight),
+        );
+        inputCanvas.width = Math.max(1, Math.round(cameraVideo.videoWidth * scale));
+        inputCanvas.height = Math.max(1, Math.round(cameraVideo.videoHeight * scale));
+        const inputContext = inputCanvas.getContext("2d");
+        if (!inputContext) {
+          throw new Error("撮影画像を描画するCanvas 2D contextを取得できませんでした。");
+        }
+        inputContext.drawImage(cameraVideo, 0, 0, inputCanvas.width, inputCanvas.height);
+
+        preview.width = inputCanvas.width;
+        preview.height = inputCanvas.height;
+        const previewContext = preview.getContext("2d");
+        if (!previewContext) {
+          throw new Error("撮影画像を表示するCanvas 2D contextを取得できませんでした。");
+        }
+        previewContext.drawImage(inputCanvas, 0, 0);
+        preview.hidden = false;
+        imageReady = true;
+        clearResults();
+        stopCamera();
+        detectButton.disabled = false;
+        setStatus(`撮影しました (${inputCanvas.width} × ${inputCanvas.height})。`);
+      }
+
+      async function requireWebGPU() {
+        if (!navigator.gpu) {
+          throw new Error("WebGPU が利用できません。WebGPU 対応ブラウザで開いてください。");
+        }
+
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+          throw new Error("WebGPU adapter を取得できませんでした。");
+        }
+
+        return adapter;
+      }
+
+      async function fileToCanvas(file, maxSide = MAX_IMAGE_SIDE) {
+        const url = URL.createObjectURL(file);
+        const image = new Image();
+
+        try {
+          image.src = url;
+          await image.decode();
+
+          const scale = Math.min(
+            1,
+            maxSide / Math.max(image.naturalWidth, image.naturalHeight),
+          );
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+
+          const context = canvas.getContext("2d");
+          if (!context) {
+            throw new Error("画像を描画するCanvas 2D contextを取得できませんでした。");
+          }
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          return canvas;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+
+      function clearResults() {
+        countsList.replaceChildren();
+        detectionsList.replaceChildren();
+      }
+
+      function disposeTensorTree(value, seen = new Set()) {
+        if (!value || typeof value !== "object" || seen.has(value)) return;
+        seen.add(value);
+
+        if (typeof value.dispose === "function") {
+          value.dispose();
+          return;
+        }
+
+        if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
+        if (Array.isArray(value)) {
+          for (const item of value) disposeTensorTree(item, seen);
+          return;
+        }
+
+        for (const item of Object.values(value)) {
+          disposeTensorTree(item, seen);
+        }
+      }
+
+      async function ensureModel() {
+        if (model && processor) return;
+        if (!modelLoadPromise) {
+          modelLoadPromise = (async () => {
+            setStatus("YOLOv10モデルを読み込んでいます。初回はダウンロードに時間がかかります。");
+            const progressCallback = (event) => {
+              if (event.status === "progress" && Number.isFinite(event.progress)) {
+                const file = event.file ? ` (${event.file})` : "";
+                setStatus(`モデルをダウンロード中: ${event.progress.toFixed(0)}%${file}`);
+              }
+            };
+
+            const loadedProcessor = await AutoProcessor.from_pretrained(MODEL_ID);
+            const loadedModel = await AutoModel.from_pretrained(MODEL_ID, {
+              device: "webgpu",
+              dtype: "q8",
+              progress_callback: progressCallback,
+            });
+            model = loadedModel;
+            processor = loadedProcessor;
+          })().catch((error) => {
+            modelLoadPromise = undefined;
+            throw error;
+          });
+        }
+
+        await modelLoadPromise;
+      }
+
+      function readDetections(output0, resizedSize, threshold) {
+        if (!output0 || !Array.isArray(output0.dims)) {
+          throw new Error("YOLOv10の出力Tensorを取得できませんでした。");
+        }
+        const dims = output0.dims;
+        if (dims[dims.length - 1] !== 6 || (dims.length !== 2 && dims.length !== 3)) {
+          throw new Error(`YOLOv10の出力shapeが想定外です: [${dims.join(", ")}]`);
+        }
+        if (dims.length === 3 && dims[0] !== 1) {
+          throw new Error(`YOLOv10のbatch sizeが想定外です: ${dims[0]}`);
+        }
+
+        const [resizedHeight, resizedWidth] = resizedSize;
+        if (!resizedHeight || !resizedWidth) {
+          throw new Error("画像の前処理後サイズを取得できませんでした。");
+        }
+
+        const scaleX = inputCanvas.width / resizedWidth;
+        const scaleY = inputCanvas.height / resizedHeight;
+        const values = output0.data;
+        const detections = [];
+
+        for (let offset = 0; offset < values.length; offset += 6) {
+          const [xmin, ymin, xmax, ymax, score, rawClassId] = values.subarray
+            ? values.subarray(offset, offset + 6)
+            : values.slice(offset, offset + 6);
+          if (!Number.isFinite(score) || score < threshold) continue;
+          if (![xmin, ymin, xmax, ymax, rawClassId].every(Number.isFinite)) continue;
+
+          const classId = Math.round(rawClassId);
+          const label = model.config.id2label?.[classId] ?? `class ${classId}`;
+          const x = Math.max(0, Math.min(inputCanvas.width, xmin * scaleX));
+          const y = Math.max(0, Math.min(inputCanvas.height, ymin * scaleY));
+          const right = Math.max(x, Math.min(inputCanvas.width, xmax * scaleX));
+          const bottom = Math.max(y, Math.min(inputCanvas.height, ymax * scaleY));
+          detections.push({ label, score, x, y, width: right - x, height: bottom - y });
+        }
+
+        return detections;
+      }
+
+      function showDetections(detections) {
+        preview.width = inputCanvas.width;
+        preview.height = inputCanvas.height;
+        preview.hidden = false;
+
+        const context = preview.getContext("2d");
+        if (!context) {
+          throw new Error("結果を描画するCanvas 2D contextを取得できませんでした。");
+        }
+        context.drawImage(inputCanvas, 0, 0);
+        context.strokeStyle = "red";
+        context.fillStyle = "red";
+        context.lineWidth = Math.max(2, inputCanvas.width / 400);
+        context.font = `${Math.max(14, inputCanvas.width / 50)}px sans-serif`;
+
+        if (detections.length === 0) {
+          const item = document.createElement("li");
+          item.textContent = "対象の食材は確認できませんでした。";
+          countsList.append(item);
+          return;
+        }
+
+        const counts = new Map();
+        for (const detection of detections) {
+          counts.set(detection.label, (counts.get(detection.label) ?? 0) + 1);
+          context.strokeRect(detection.x, detection.y, detection.width, detection.height);
+          context.fillText(
+            `${detection.label} ${(detection.score * 100).toFixed(0)}%`,
+            detection.x,
+            Math.max(14, detection.y - 4),
+          );
+
+          const item = document.createElement("li");
+          item.textContent = `${detection.label}: 信頼度 ${(detection.score * 100).toFixed(1)}%`;
+          detectionsList.append(item);
+        }
+
+        for (const [label, count] of counts) {
+          const item = document.createElement("li");
+          item.textContent = `${label}: ${count}個`;
+          countsList.append(item);
+        }
+      }
+
+      async function runExclusive(task) {
+        if (busy || cameraBusy) return;
+        busy = true;
+        imageInput.disabled = true;
+        detectButton.disabled = true;
+        updateCameraButtons();
+
+        try {
+          await task();
+        } catch (error) {
+          console.error(error);
+          setStatus(`エラー: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          busy = false;
+          imageInput.disabled = false;
+          detectButton.disabled = !imageReady;
+          updateCameraButtons();
+        }
+      }
+
+      imageInput.addEventListener("change", async () => {
+        stopCamera();
+        const file = imageInput.files?.[0];
+        imageReady = false;
+        detectButton.disabled = true;
+        clearResults();
+        preview.hidden = true;
+
+        if (!file) {
+          preview.hidden = true;
+          setStatus("画像を選択してください。");
+          return;
+        }
+
+        imageInput.disabled = true;
+        updateCameraButtons();
+        setStatus("画像を読み込んでいます。");
+        try {
+          const canvas = await fileToCanvas(file);
+          inputCanvas.width = canvas.width;
+          inputCanvas.height = canvas.height;
+          const inputContext = inputCanvas.getContext("2d");
+          const previewContext = preview.getContext("2d");
+          if (!inputContext || !previewContext) {
+            throw new Error("画像を描画するCanvas 2D contextを取得できませんでした。");
+          }
+          inputContext.drawImage(canvas, 0, 0);
+          preview.width = canvas.width;
+          preview.height = canvas.height;
+          previewContext.drawImage(canvas, 0, 0);
+          preview.hidden = false;
+          imageReady = true;
+          setStatus(`画像を読み込みました (${canvas.width} × ${canvas.height})。`);
+        } catch (error) {
+          console.error(error);
+          setStatus(`画像を読み込めませんでした: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          imageInput.disabled = false;
+          detectButton.disabled = !imageReady;
+          updateCameraButtons();
+        }
+      });
+
+      cameraStartButton.addEventListener("click", async () => {
+        try {
+          await startCamera();
+        } catch (error) {
+          console.error(error);
+          stopCamera();
+          setStatus(`カメラを利用できません: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+
+      cameraCaptureButton.addEventListener("click", () => {
+        try {
+          captureCameraFrame();
+        } catch (error) {
+          console.error(error);
+          stopCamera();
+          setStatus(`撮影できませんでした: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+
+      detectButton.addEventListener("click", () => runExclusive(async () => {
+        if (!imageReady) {
+          throw new Error("先に画像を選択してください。");
+        }
+
+        const threshold = Number(thresholdInput.value);
+        if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+          throw new Error("信頼度しきい値は0から1の範囲で入力してください。");
+        }
+
+        clearResults();
+        await requireWebGPU();
+        await ensureModel();
+
+        let processed;
+        let outputs;
+        try {
+          setStatus("画像を解析しています。");
+          const rawImage = RawImage.fromCanvas(inputCanvas);
+          processed = await processor(rawImage);
+          outputs = await model({ images: processed.pixel_values });
+          const resizedSize = processed.reshaped_input_sizes?.[0];
+          const detections = readDetections(outputs.output0, resizedSize, threshold)
+            .flatMap((detection) => {
+              const foodLabel = FOOD_LABELS.get(detection.label.trim().toLowerCase());
+              return foodLabel ? [{ ...detection, label: foodLabel }] : [];
+            });
+          showDetections(detections);
+          setStatus(
+            detections.length
+              ? `食材を確認しました: ${detections.length}件`
+              : "対象の食材は確認できませんでした。",
+          );
+        } finally {
+          disposeTensorTree(outputs);
+          disposeTensorTree(processed);
+        }
+      }));
+
+      window.addEventListener("pagehide", () => {
+        stopCamera();
+        model?.dispose?.();
+      });
+    </script>
+  </body>
+</html>
